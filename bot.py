@@ -40,8 +40,12 @@ FIRE = "🔥"
 
 KST = ZoneInfo("Asia/Seoul")
 
-# 하루 1회 리마인드 시각 (급하지 않은 모든 미완료 건)
-DAILY_REMIND_TIME = time(hour=10, minute=0, tzinfo=KST)
+# 정기 리마인드 시각들 (급하지 않은 모든 미완료 건). KST 기준.
+DAILY_REMIND_TIMES = [
+    time(hour=9, minute=0, tzinfo=KST),
+    time(hour=13, minute=0, tzinfo=KST),
+    time(hour=16, minute=0, tzinfo=KST),
+]
 # 🔥 급한 건 반복 주기(시간)
 URGENT_REMIND_INTERVAL_HOURS = 2
 # 새로 만든 스레드 자동 보관까지의 시간(분). 60/1440/4320/10080 중 하나.
@@ -329,10 +333,10 @@ async def _before_urgent():
     await bot.wait_until_ready()
 
 
-@tasks.loop(time=DAILY_REMIND_TIME)
+@tasks.loop(time=DAILY_REMIND_TIMES)
 async def daily_reminder_loop():
     for item in list(tracked.values()):
-        if item.is_active:   # 급한 건 포함 모든 미완료 건 하루 1회
+        if item.is_active:   # 급한 건 포함 모든 미완료 건 정해진 시각마다
             await send_reminder(item)
 
 
