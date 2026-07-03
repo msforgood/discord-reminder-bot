@@ -29,6 +29,24 @@ python bot.py
 > `.env` 는 `.gitignore` 에 포함되어 커밋되지 않습니다.
 > 환경변수(`export DISCORD_BOT_TOKEN=...`)로 직접 넣어도 동작합니다.
 
+## 상시 실행 (systemd)
+봇은 Discord 게이트웨이에 계속 연결되어 있어야 반응 이벤트를 받고 정기 리마인드를
+발동합니다(24시간 실행, cron 아님). 리눅스 서버에서는 `discord-reminder-bot.service`
+로 상시 실행 + 자동 재시작을 설정할 수 있습니다.
+
+```bash
+# 1) 코드를 서버에 배치 (예: /opt/discord-reminder-bot) 하고 의존성 설치 + .env 준비
+# 2) 유닛 파일 안의 User / WorkingDirectory / ExecStart 를 환경에 맞게 수정
+sudo cp discord-reminder-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now discord-reminder-bot   # 부팅 시 자동 실행 + 지금 시작
+sudo systemctl status discord-reminder-bot          # 상태 확인
+journalctl -u discord-reminder-bot -f               # 로그 실시간 보기
+```
+> `.env` 는 `WorkingDirectory` 에서 `load_dotenv()` 가 읽으므로, 유닛 파일에
+> 토큰을 넣을 필요가 없습니다. 크래시/재부팅 시 `Restart=always` 로 자동 복구됩니다.
+> 재시작하면 추적 상태(메모리 저장)는 초기화되므로 `!scan` 으로 복구하세요.
+
 ## 명령어
 - `!scan` : 현재 채널의 최근 메시지에서 이모지를 다시 읽어 등록 (봇 재시작 후 복구용)
 - `!pending` : 추적 중인 미완료 건 목록 보기
