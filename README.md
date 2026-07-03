@@ -43,9 +43,9 @@ python bot.py
 ### 요약 기능(Gemini 무료 티어) 켜기
 1. https://aistudio.google.com/apikey 에서 API 키 발급 (카드 불필요, 무료 티어)
 2. `pip install google-genai`
-3. 환경변수와 토글 설정 후 실행:
+3. `.env` 에 키를 추가하고 토글 설정 후 실행:
    ```bash
-   export GEMINI_API_KEY="발급받은키"
+   echo 'GEMINI_API_KEY=발급받은키' >> .env
    ```
    그리고 `bot.py` 상단에서 `USE_LLM_SUMMARY = True` 로 변경.
 
