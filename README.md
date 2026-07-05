@@ -47,6 +47,30 @@ journalctl -u discord-reminder-bot -f               # 로그 실시간 보기
 > 토큰을 넣을 필요가 없습니다. 크래시/재부팅 시 `Restart=always` 로 자동 복구됩니다.
 > 재시작하면 추적 상태(메모리 저장)는 초기화되므로 `!scan` 으로 복구하세요.
 
+### 자주 쓰는 systemctl 명령어
+```bash
+# 시작 / 중지 / 재시작
+sudo systemctl start   discord-reminder-bot   # 시작
+sudo systemctl stop    discord-reminder-bot   # 중지
+sudo systemctl restart discord-reminder-bot   # 재시작 (코드 수정 후 반영)
+
+# 부팅 시 자동 실행 on/off
+sudo systemctl enable  discord-reminder-bot   # 자동 실행 켜기
+sudo systemctl disable discord-reminder-bot   # 자동 실행 끄기
+
+# 상태 / 로그 확인
+sudo systemctl status  discord-reminder-bot   # 현재 상태
+journalctl -u discord-reminder-bot -f         # 로그 실시간 보기
+journalctl -u discord-reminder-bot -n 100     # 최근 100줄
+journalctl -u discord-reminder-bot --since "1 hour ago"
+
+# 유닛 파일(.service)을 수정한 뒤에는 daemon-reload 필요
+sudo systemctl daemon-reload
+```
+> 참고: `stop` 은 일시 중지일 뿐 부팅 시 자동 실행 설정은 유지됩니다. 자동 실행까지
+> 완전히 끄려면 `disable` (또는 한 번에 `sudo systemctl disable --now discord-reminder-bot`) 하세요.
+> `.env` 값(토큰 등)을 바꾼 경우엔 `restart` 로 다시 읽어들이면 됩니다.
+
 ## 명령어
 - `!scan` : 현재 채널의 최근 메시지에서 이모지를 다시 읽어 등록 (봇 재시작 후 복구용)
 - `!pending` : 추적 중인 미완료 건 목록 보기
