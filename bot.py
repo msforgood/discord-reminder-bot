@@ -190,6 +190,13 @@ async def build_context(message: discord.Message) -> str:
     return "\n".join(lines) if lines else "_(맥락을 불러오지 못했습니다)_"
 
 
+def clip_tail(text: str, limit: int) -> str:
+    """임베드 필드 길이 제한에 맞춰 자르되, 최신 내용(뒤쪽)을 남긴다."""
+    if len(text) <= limit:
+        return text
+    return "…\n" + text[-(limit - 2):]
+
+
 async def build_thread_context(item: TrackedMessage) -> str:
     """
     이 건의 스레드 안에서 오간 '사람' 대화를 모은다. 추론의 핵심 근거.
@@ -246,13 +253,16 @@ async def infer_task_with_llm(thread_text: str, channel_text: str) -> Optional[s
         resp = await client.aio.models.generate_content(
             model=LLM_MODEL,
             contents=(
-                "너는 업무 리마인드 도우미다. 아래 자료로 담당자가 지금 무엇을 처리해야 하는지 추론해라.\n"
-                "**스레드 대화가 있으면 그것을 가장 중요한 근거로 삼아라** — 이 건에 대한 실제 논의와 "
-                "진행상황이 담겨 있다. 채널 주변 맥락은 스레드가 비었을 때만 보조로 참고해라.\n"
-                "- 문장을 그대로 복사하지 말고 맥락으로 의도를 해석할 것\n"
-                "- 무엇을(what)/왜(why)/지금까지 진행/남은 일 중심으로 한국어 2~4문장\n"
-                "- 근거가 부족하면 '근거 부족' 이라고 밝히고 합리적 추정을 덧붙일 것\n"
-                "사족 없이 추론 결과만 출력:\n\n"
+                "너는 다정한 업무 리마인드 도우미야. 아래 자료를 보고 담당자가 어떤 일을 하려던 건지 "
+                "정리해줘.\n"
+                "**스레드 대화가 있으면 그걸 가장 중요한 근거로 삼아** — 이 건의 실제 논의와 진행상황이 "
+                "담겨 있어. 채널 주변 맥락은 스레드가 비었을 때만 보조로 참고해.\n"
+                "- 문장을 그대로 복붙하지 말고 맥락으로 의도를 해석할 것\n"
+                "- 무엇을/왜/지금까지 진행된 부분/남은 부분을 '상황 설명'하듯 부드럽게 한국어 2~4문장\n"
+                "- 재촉하거나 압박하는 표현('빨리', '서둘러', '빠른 시일 내에', '~해야 합니다' 등)은 쓰지 말 것\n"
+                "- 톤은 유머러스하고 적당히 귀엽게, 맨 끝에 짧은 응원 한마디로 마무리(예: 화이팅! 🌱)\n"
+                "- 근거가 부족하면 '근거가 조금 부족해요' 정도로 부드럽게 밝히고 추정을 덧붙일 것\n"
+                "추론 결과만 출력:\n\n"
                 + material
             ),
         )
@@ -274,9 +284,18 @@ async def send_reminder(item: TrackedMessage) -> bool:
         log.warning("리마인드 대상 조회 실패 (message %s): %s", item.message_id, exc)
         return False
 
-    context = await build_context(message)
+    # 스레드 대화가 핵심 근거. 스레드에 사람 대화가 있으면 그것만 쓰고,
+    # 비어 있을 때만(주로 스레드 갓 생성됨) 아래 주변 메시지로 폴백한다.
     thread_context = await build_thread_context(item)
-    inference = await infer_task_with_llm(thread_context, context)
+    if thread_context:
+        channel_context = ""  # 스레드가 있으면 주변 채널 조회 자체를 생략
+        display_context = thread_context
+        display_name = "🧵 스레드 내용"
+    else:
+        channel_context = await build_context(message)
+        display_context = channel_context
+        display_name = "맥락(주변 메시지)"
+    inference = await infer_task_with_llm(thread_context, channel_context)
     urgent = item.is_urgent
 
     embed = discord.Embed(
@@ -296,7 +315,7 @@ async def send_reminder(item: TrackedMessage) -> bool:
     )
     if inference:  # LLM 이 맥락으로부터 추론한 '해야 할 일'
         embed.add_field(name="🤖 AI 맥락 추론", value=inference[:1000], inline=False)
-    embed.add_field(name="맥락(원본 대화)", value=context[:1000], inline=False)
+    embed.add_field(name=display_name, value=clip_tail(display_context, 1000), inline=False)
     footer = "완료되면 원본 메시지에 ⚡️ 를 달아주세요."
     if inference:
         footer += " · AI 추론은 참고용입니다."
