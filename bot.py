@@ -17,6 +17,7 @@
 """
 
 import os
+import sys
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, time, timezone
@@ -54,6 +55,13 @@ THREAD_AUTO_ARCHIVE_MINUTES = 10080  # 7일
 CONTEXT_MESSAGE_COUNT = 4
 # !scan 시 채널에서 훑어볼 최근 메시지 수
 SCAN_HISTORY_LIMIT = 200
+
+# 배포 확인용: 봇이 기동되면(프로세스당 최초 1회) "정상 기동" 알림을 보낸다.
+# 정기 리마인드 시각(09/13/16시)까지 기다리지 않고 배포 직후 동작을 바로 확인할 수 있다.
+# 우선순위: 웹훅(STARTUP_NOTIFY_WEBHOOK) → 채널(STARTUP_NOTIFY_CHANNEL_ID) → 로그만.
+# 웹훅은 채널 전송 권한/인텐트 없이도 동작해서 배포 확인용으로 가장 안전하다.
+STARTUP_NOTIFY_WEBHOOK = os.environ.get("STARTUP_NOTIFY_WEBHOOK", "")
+STARTUP_NOTIFY_CHANNEL_ID = os.environ.get("STARTUP_NOTIFY_CHANNEL_ID", "")
 
 # 선택: Gemini 무료 티어로 맥락을 한두 문장 요약해서 보여주기.
 # GEMINI_API_KEY 환경변수가 있고 아래가 True 이면 활성화된다.
@@ -95,6 +103,9 @@ class TrackedMessage:
 
 # message_id -> TrackedMessage
 tracked: dict[int, TrackedMessage] = {}
+
+# on_ready 는 재접속마다 다시 호출될 수 있으므로, 기동 알림은 프로세스당 1회만 보낸다.
+_startup_notified = False
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +264,57 @@ async def on_ready():
         urgent_reminder_loop.start()
     if not daily_reminder_loop.is_running():
         daily_reminder_loop.start()
+    await send_startup_notice()
+
+
+async def send_startup_notice() -> None:
+    """배포 직후 봇이 실제로 연결·전송까지 되는지 확인하기 위한 1회성 기동 알림."""
+    global _startup_notified
+    if _startup_notified:
+        return
+    _startup_notified = True  # 재접속으로 on_ready 가 또 불려도 중복 전송 안 함
+
+    times = ", ".join(f"{t.hour:02d}:{t.minute:02d}" for t in DAILY_REMIND_TIMES)
+    log.info(
+        "기동 완료: 서버 %d개, 추적 %d건, 정기 리마인드 %s (KST)",
+        len(bot.guilds), len(tracked), times,
+    )
+
+    embed = discord.Embed(
+        title="✅ 리마인드 봇 기동 완료",
+        description=(
+            f"봇이 정상적으로 로그인·연결되었습니다.\n"
+            f"정기 리마인드 예정 시각: **{times}** (KST)\n"
+            f"현재 추적 중인 미완료 건: **{len(tracked)}**개"
+        ),
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text="이 메시지가 보이면 봇이 배포·연결까지 정상입니다.")
+
+    # 1순위: 웹훅 (권한/인텐트 불필요, 배포 확인에 가장 안전)
+    if STARTUP_NOTIFY_WEBHOOK:
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(STARTUP_NOTIFY_WEBHOOK, session=session)
+                await webhook.send(embed=embed, username="리마인드 봇")
+            log.info("기동 알림 웹훅 전송 완료.")
+        except Exception as exc:  # 웹훅 실패해도 봇 본 기능은 계속
+            log.warning("기동 알림 웹훅 전송 실패: %s", exc)
+        return
+
+    # 2순위: 채널 ID
+    if STARTUP_NOTIFY_CHANNEL_ID:
+        try:
+            channel = await resolve_channel(int(STARTUP_NOTIFY_CHANNEL_ID))
+            await channel.send(embed=embed)
+            log.info("기동 알림 전송 완료 (channel %s)", STARTUP_NOTIFY_CHANNEL_ID)
+        except (ValueError, discord.NotFound, discord.HTTPException) as exc:
+            log.warning("기동 알림 채널 전송 실패 (%s): %s", STARTUP_NOTIFY_CHANNEL_ID, exc)
+        return
+
+    log.info("기동 알림 대상 미설정 → 로그로만 확인.")
 
 
 @bot.event
@@ -400,4 +462,20 @@ async def pending(ctx: commands.Context):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("환경변수 DISCORD_BOT_TOKEN 을 설정해주세요.")
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except discord.LoginFailure:
+        # 토큰이 잘못됐을 때: 재시작해도 계속 실패하므로 명확히 로그를 남기고 종료한다.
+        # (systemd StartLimit 이 곧 재시작을 멈추지만, 여기서도 무의미한 재시도를 막는다)
+        log.error(
+            "로그인 실패: 토큰이 올바르지 않습니다. Discord 개발자 포털에서 토큰을 "
+            "재발급해 .env 의 DISCORD_BOT_TOKEN 을 갱신하세요. (재시작해도 해결되지 않음)"
+        )
+        sys.exit(1)
+    except discord.PrivilegedIntentsRequired:
+        # message_content 는 특권 인텐트라 포털에서 명시적으로 켜야 한다. 역시 영구 오류.
+        log.error(
+            "특권 인텐트 미허용: 개발자 포털(Bot → Privileged Gateway Intents)에서 "
+            "'Message Content Intent' 를 켜세요. (재시작해도 해결되지 않음)"
+        )
+        sys.exit(1)

@@ -2,18 +2,23 @@
 Description=Emoji reminder Discord bot
 After=network-online.target
 Wants=network-online.target
+# 폭주 방지: 300초 안에 5번 이상 실패하면 systemd 가 재시작을 포기한다.
+# (토큰 오류 같은 영구적 실패로 Discord 로그인 API 를 무한히 두드리는 것을 막는다)
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 # 봇을 실행할 리눅스 사용자 (root 대신 전용 계정 권장). 실제 계정명으로 수정하세요.
-User=botuser
+User=ubuntu
 # 리포지토리 경로에 맞게 수정하세요.
-WorkingDirectory=/opt/discord-reminder-bot
-# venv 를 쓰면 /opt/discord-reminder-bot/.venv/bin/python 로 바꾸세요.
-ExecStart=/usr/bin/python3 bot.py
+WorkingDirectory=/home/ubuntu/discord-reminder-bot
+# venv 의 파이썬을 직접 지정 (시스템 python3 에는 의존성이 없을 수 있음).
+ExecStart=/home/ubuntu/discord-reminder-bot/.venv/bin/python bot.py
 # .env(DISCORD_BOT_TOKEN 등)는 load_dotenv() 가 WorkingDirectory 에서 읽어옵니다.
-Restart=always
-RestartSec=5
+# on-failure: 정상 종료(exit 0)면 재시작하지 않는다. 인증 실패 등은 exit 1 → 위 StartLimit 이 개입.
+Restart=on-failure
+RestartSec=30
 # 로그는 journald 로 (journalctl -u discord-reminder-bot)
 StandardOutput=journal
 StandardError=journal
