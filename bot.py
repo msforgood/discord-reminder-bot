@@ -53,6 +53,8 @@ URGENT_REMIND_INTERVAL_HOURS = 2
 THREAD_AUTO_ARCHIVE_MINUTES = 10080  # 7일
 # 리마인드에 함께 보여줄 앞뒤 맥락 메시지 수
 CONTEXT_MESSAGE_COUNT = 4
+# 추론 시 참고할 스레드 내부 메시지 수(최신 기준). 스레드가 핵심 근거다.
+THREAD_CONTEXT_LIMIT = 30
 # !scan 시 채널에서 훑어볼 최근 메시지 수
 SCAN_HISTORY_LIMIT = 200
 
@@ -63,11 +65,12 @@ SCAN_HISTORY_LIMIT = 200
 STARTUP_NOTIFY_WEBHOOK = os.environ.get("STARTUP_NOTIFY_WEBHOOK", "")
 STARTUP_NOTIFY_CHANNEL_ID = os.environ.get("STARTUP_NOTIFY_CHANNEL_ID", "")
 
-# 선택: Gemini 무료 티어로 맥락을 한두 문장 요약해서 보여주기.
-# GEMINI_API_KEY 환경변수가 있고 아래가 True 이면 활성화된다.
+# 선택: Gemini 무료 티어로 리마인드에 '맥락 추론'을 덧붙인다.
+# 근처 메시지를 그대로 보여주는 대신, 대화 흐름으로부터 "무엇을 왜 처리해야 하는지"를 추론한다.
+# GEMINI_API_KEY 가 있고 USE_LLM_SUMMARY 가 참이면 활성화된다(.env 로 끌 수 있음).
 # 키 발급: https://aistudio.google.com/apikey (무료 티어, 카드 불필요)
 # 주의: 무료 티어 입력은 Google 모델 학습에 사용될 수 있음.
-USE_LLM_SUMMARY = False
+USE_LLM_SUMMARY = os.environ.get("USE_LLM_SUMMARY", "true").lower() in ("1", "true", "yes")
 LLM_MODEL = "gemini-2.5-flash"  # 무료 티어 지원 모델(Flash 계열)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -184,49 +187,96 @@ async def build_context(message: discord.Message) -> str:
     except discord.HTTPException as exc:
         log.warning("맥락 수집 실패 (message %s): %s", message.id, exc)
 
-    text = "\n".join(lines) if lines else "_(맥락을 불러오지 못했습니다)_"
-
-    if USE_LLM_SUMMARY and os.environ.get("GEMINI_API_KEY"):
-        summary = await summarize_with_llm(text)
-        if summary:
-            text = f"**요약:** {summary}\n\n{text}"
-    return text
+    return "\n".join(lines) if lines else "_(맥락을 불러오지 못했습니다)_"
 
 
-async def summarize_with_llm(context_text: str) -> Optional[str]:
-    """선택 기능: Gemini 무료 티어로 '무슨 건인지' 한두 문장 요약."""
+async def build_thread_context(item: TrackedMessage) -> str:
+    """
+    이 건의 스레드 안에서 오간 '사람' 대화를 모은다. 추론의 핵심 근거.
+    - 봇이 남긴 리마인드/안내 메시지는 제외(노이즈·자기참조 방지)
+    - 빈 내용(임베드만 있는 메시지 등)도 제외
+    """
+    if item.thread_id is None:
+        return ""
+    lines: list[str] = []
+    try:
+        thread = await resolve_channel(item.thread_id)
+        msgs = [m async for m in thread.history(limit=THREAD_CONTEXT_LIMIT)]
+        msgs.sort(key=lambda m: m.created_at)
+        for m in msgs:
+            if bot.user and m.author.id == bot.user.id:
+                continue
+            content = (m.content or "").strip().replace("\n", " ")
+            if not content:
+                continue
+            snippet = content[:200] + ("…" if len(content) > 200 else "")
+            lines.append(f"**{m.author.display_name}**: {snippet}")
+    except discord.HTTPException as exc:
+        log.warning("스레드 맥락 수집 실패 (thread %s): %s", item.thread_id, exc)
+    return "\n".join(lines)
+
+
+async def infer_task_with_llm(thread_text: str, channel_text: str) -> Optional[str]:
+    """
+    Gemini 로 '무엇을/왜 처리해야 하는지'를 추론한다.
+    스레드 대화가 있으면 그것을 최우선 근거로, 채널 주변 맥락은 보조로 삼는다.
+    """
+    if not (USE_LLM_SUMMARY and os.environ.get("GEMINI_API_KEY")):
+        return None
+    # 스레드도 없고 채널 맥락도 못 불러왔으면 추론 불가
+    if not thread_text and channel_text.startswith("_("):
+        return None
     try:
         from google import genai  # 지연 임포트: 미설치여도 봇은 동작
     except ImportError:
         return None
+
+    parts = []
+    if thread_text:
+        parts.append(
+            "[이 건의 스레드 대화 — 가장 중요한 근거. 실제 논의·진행상황이다]\n" + thread_text
+        )
+    else:
+        parts.append("[이 건의 스레드 대화 — 없음]")
+    parts.append("[채널 주변 맥락 — 보조 참고용]\n" + channel_text)
+    material = "\n\n".join(parts)
+
     try:
         client = genai.Client()  # 환경변수 GEMINI_API_KEY 사용
         resp = await client.aio.models.generate_content(
             model=LLM_MODEL,
             contents=(
-                "다음 디스코드 대화 맥락에서 '처리해야 할 일'이 무엇인지 "
-                "한국어로 한두 문장으로 요약해줘. 사족 없이 요약만:\n\n"
-                + context_text
+                "너는 업무 리마인드 도우미다. 아래 자료로 담당자가 지금 무엇을 처리해야 하는지 추론해라.\n"
+                "**스레드 대화가 있으면 그것을 가장 중요한 근거로 삼아라** — 이 건에 대한 실제 논의와 "
+                "진행상황이 담겨 있다. 채널 주변 맥락은 스레드가 비었을 때만 보조로 참고해라.\n"
+                "- 문장을 그대로 복사하지 말고 맥락으로 의도를 해석할 것\n"
+                "- 무엇을(what)/왜(why)/지금까지 진행/남은 일 중심으로 한국어 2~4문장\n"
+                "- 근거가 부족하면 '근거 부족' 이라고 밝히고 합리적 추정을 덧붙일 것\n"
+                "사족 없이 추론 결과만 출력:\n\n"
+                + material
             ),
         )
         return (getattr(resp, "text", "") or "").strip() or None
     except Exception as exc:  # 네트워크/인증 등 실패해도 리마인드는 계속
-        log.warning("Gemini 요약 실패: %s", exc)
+        log.warning("Gemini 추론 실패: %s", exc)
         return None
 
 
-async def send_reminder(item: TrackedMessage) -> None:
+async def send_reminder(item: TrackedMessage) -> bool:
+    """해당 건의 스레드로 리마인드를 보낸다. 실제로 전송했으면 True."""
     if not item.is_active or item.thread_id is None:
-        return
+        return False
     try:
         thread = await resolve_channel(item.thread_id)
         source_channel = await resolve_channel(item.channel_id)
         message = await source_channel.fetch_message(item.message_id)
     except (discord.NotFound, discord.HTTPException) as exc:
         log.warning("리마인드 대상 조회 실패 (message %s): %s", item.message_id, exc)
-        return
+        return False
 
     context = await build_context(message)
+    thread_context = await build_thread_context(item)
+    inference = await infer_task_with_llm(thread_context, context)
     urgent = item.is_urgent
 
     embed = discord.Embed(
@@ -244,14 +294,21 @@ async def send_reminder(item: TrackedMessage) -> None:
         value=f"**{message.author.display_name}**: {original[:1000]}",
         inline=False,
     )
-    embed.add_field(name="맥락", value=context[:1000], inline=False)
-    embed.set_footer(text="완료되면 원본 메시지에 ⚡️ 를 달아주세요.")
+    if inference:  # LLM 이 맥락으로부터 추론한 '해야 할 일'
+        embed.add_field(name="🤖 AI 맥락 추론", value=inference[:1000], inline=False)
+    embed.add_field(name="맥락(원본 대화)", value=context[:1000], inline=False)
+    footer = "완료되면 원본 메시지에 ⚡️ 를 달아주세요."
+    if inference:
+        footer += " · AI 추론은 참고용입니다."
+    embed.set_footer(text=footer)
 
     try:
         await thread.send(embed=embed)
         item.last_reminded = datetime.now(timezone.utc)
+        return True
     except discord.HTTPException as exc:
         log.warning("리마인드 전송 실패 (thread %s): %s", item.thread_id, exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -442,18 +499,75 @@ async def scan(ctx: commands.Context):
     await ctx.send(f"🔎 스캔 완료. 미완료 건 {found}개를 등록했습니다.")
 
 
+def jump_url_for(item: TrackedMessage) -> str:
+    """추가 조회 없이 ID 만으로 원본 메시지로 가는 점프 링크를 만든다."""
+    return (
+        f"https://discord.com/channels/"
+        f"{item.guild_id}/{item.channel_id}/{item.message_id}"
+    )
+
+
+async def describe_item(item: TrackedMessage) -> str:
+    """미완료 건을 사람이 알아볼 수 있게: 태그 + 내용 미리보기 + 원본 링크."""
+    tag = "🔥" if item.is_urgent else "⭐"
+    try:
+        channel = await resolve_channel(item.channel_id)
+        message = await channel.fetch_message(item.message_id)
+        author = message.author.display_name
+        content = (message.content or "").strip().replace("\n", " ")
+        if content:
+            preview = f"**{author}**: {content[:80]}" + ("…" if len(content) > 80 else "")
+        else:
+            preview = f"**{author}**: _(내용 없음)_"
+    except (discord.NotFound, discord.HTTPException):
+        preview = "_(메시지를 불러오지 못함)_"
+    return f"{tag} {preview}\n    → [원본 열기]({jump_url_for(item)})"
+
+
+def active_items_for(ctx: commands.Context) -> list[TrackedMessage]:
+    """이 명령이 실행된 서버의 미완료 건들(서버 밖이면 전체)."""
+    items = [i for i in tracked.values() if i.is_active]
+    if ctx.guild is not None:
+        items = [i for i in items if i.guild_id == ctx.guild.id]
+    return items
+
+
 @bot.command(name="pending")
 async def pending(ctx: commands.Context):
     """현재 추적 중인 미완료 건 목록을 보여준다."""
-    active = [i for i in tracked.values() if i.is_active]
+    active = active_items_for(ctx)
     if not active:
         await ctx.send("현재 미완료 건이 없습니다. ✨")
         return
-    lines = []
-    for i in active:
-        tag = "🔥" if i.is_urgent else "⭐"
-        lines.append(f"{tag} message `{i.message_id}` (thread `{i.thread_id}`)")
-    await ctx.send("**미완료 목록**\n" + "\n".join(lines[:25]))
+    lines = [await describe_item(i) for i in active[:25]]
+    text = "**미완료 목록**\n" + "\n".join(lines)
+    if len(active) > 25:
+        text += f"\n… 외 {len(active) - 25}건"
+    await ctx.send(text)
+
+
+@bot.command(name="remind")
+async def remind(ctx: commands.Context):
+    """정기 시각을 기다리지 않고 지금 당장 모든 미완료 건에 리마인드를 보낸다."""
+    active = active_items_for(ctx)
+    if not active:
+        await ctx.send("지금 리마인드할 미완료 건이 없습니다. ✨")
+        return
+
+    await ctx.send(f"🔔 미완료 {len(active)}건에 대해 지금 리마인드를 보냅니다…")
+    sent = 0
+    skipped = 0
+    for item in active:
+        if await send_reminder(item):
+            sent += 1
+        else:
+            # 스레드가 아직 없거나(스레드 생성 실패) 원본을 못 찾은 경우
+            skipped += 1
+
+    msg = f"✅ 리마인드 전송 완료: {sent}건 (각 건의 스레드로 전송)"
+    if skipped:
+        msg += f"\n⚠️ {skipped}건은 스레드가 없거나 원본을 찾지 못해 건너뛰었습니다."
+    await ctx.send(msg)
 
 
 # ---------------------------------------------------------------------------
