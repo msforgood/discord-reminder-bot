@@ -9,7 +9,7 @@
 - ⭐️ 있고 ⚡️ 없는 메시지 → 스레드 생성(없으면) 후 그 스레드에서 리마인드
 - 메시지가 이미 스레드 안에 있으면 → 그 스레드에서 리마인드
 - 🔥 붙은 급한 건 → 자주 리마인드 / 나머지 → 하루 1회
-- 리마인드 시 원본 메시지 + 위아래 맥락을 함께 보여줌
+- 리마인드 시 원본/주변 맥락을 그대로 복붙하지 않고, 압축된 토픽 한 줄 + AI 맥락 추론만 보여줌
 - ⚡️ 가 붙으면 완료 처리하고 리마인드 중단
 
 상태는 메모리에만 저장한다(봇 재시작 시 초기화). 재시작 후에는
@@ -179,10 +179,7 @@ async def send_thread_opening_notice(
     urgent = item.is_urgent
     embed = discord.Embed(
         title=("🔥 급한 미완료 작업으로 등록됨" if urgent else "⭐ 미완료 작업으로 등록됨"),
-        description=(
-            "이 건을 여기서 챙길게요. 완료되면 원본 메시지에 ⚡️ 를 달아주세요.\n"
-            f"[원본 메시지로 이동]({message.jump_url})"
-        ),
+        description="이 건을 여기서 챙길게요. 완료되면 원본 메시지에 ⚡️ 를 달아주세요.",
         color=discord.Color.red() if urgent else discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
     )
@@ -222,13 +219,6 @@ async def build_context(message: discord.Message) -> str:
     return "\n".join(lines) if lines else "_(맥락을 불러오지 못했습니다)_"
 
 
-def clip_tail(text: str, limit: int) -> str:
-    """임베드 필드 길이 제한에 맞춰 자르되, 최신 내용(뒤쪽)을 남긴다."""
-    if len(text) <= limit:
-        return text
-    return "…\n" + text[-(limit - 2):]
-
-
 async def build_thread_context(item: TrackedMessage) -> str:
     """
     이 건의 스레드 안에서 오간 '사람' 대화를 모은다. 추론의 핵심 근거.
@@ -255,20 +245,46 @@ async def build_thread_context(item: TrackedMessage) -> str:
     return "\n".join(lines)
 
 
-async def infer_task_with_llm(thread_text: str, channel_text: str) -> Optional[str]:
+def _parse_topic_inference(text: str) -> tuple[Optional[str], Optional[str]]:
+    """LLM 출력에서 '토픽:' 한 줄과 '추론:' 본문을 분리한다."""
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+    topic: Optional[str] = None
+    inference: Optional[str] = None
+    if "추론:" in raw:
+        head, _, tail = raw.partition("추론:")
+        inference = tail.strip() or None
+        for line in head.splitlines():
+            line = line.strip()
+            if line.startswith("토픽:"):
+                topic = line[len("토픽:"):].strip() or None
+                break
+    else:
+        # 형식을 안 지켰으면 전체를 추론으로 간주(토픽은 폴백에 맡긴다)
+        inference = raw
+    if topic:
+        topic = topic.lstrip("*#-•> ").strip() or None
+    return topic, inference
+
+
+async def infer_task_with_llm(
+    thread_text: str, channel_text: str
+) -> tuple[Optional[str], Optional[str]]:
     """
-    Gemini 로 '무엇을/왜 처리해야 하는지'를 추론한다.
+    Gemini 로 '압축된 토픽 한 줄' + '무엇을/왜 처리해야 하는지 추론'을 만든다.
     스레드 대화가 있으면 그것을 최우선 근거로, 채널 주변 맥락은 보조로 삼는다.
+    반환: (토픽, 추론). 실패/비활성이면 (None, None).
     """
     if not (USE_LLM_SUMMARY and os.environ.get("GEMINI_API_KEY")):
-        return None
+        return None, None
     # 스레드도 없고 채널 맥락도 못 불러왔으면 추론 불가
     if not thread_text and channel_text.startswith("_("):
-        return None
+        return None, None
     try:
         from google import genai  # 지연 임포트: 미설치여도 봇은 동작
     except ImportError:
-        return None
+        return None, None
 
     parts = []
     if thread_text:
@@ -289,19 +305,21 @@ async def infer_task_with_llm(thread_text: str, channel_text: str) -> Optional[s
                 "정리해줘.\n"
                 "**스레드 대화가 있으면 그걸 가장 중요한 근거로 삼아** — 이 건의 실제 논의와 진행상황이 "
                 "담겨 있어. 채널 주변 맥락은 스레드가 비었을 때만 보조로 참고해.\n"
-                "- 문장을 그대로 복붙하지 말고 맥락으로 의도를 해석할 것\n"
-                "- 무엇을/왜/지금까지 진행된 부분/남은 부분을 '상황 설명'하듯 부드럽게 한국어 2~4문장\n"
+                "출력은 정확히 아래 두 부분으로만:\n"
+                "토픽: <이 건이 무엇인지 한 줄로 압축한 제목. 30자 안팎의 명사구, 문장부호·따옴표 없이>\n"
+                "추론: <무엇을/왜/지금까지 진행된 부분/남은 부분을 상황 설명하듯 부드럽게 한국어 2~4문장>\n"
+                "- 원문 문장을 그대로 복붙하지 말고 맥락으로 의도를 해석할 것\n"
                 "- 재촉하거나 압박하는 표현('빨리', '서둘러', '빠른 시일 내에', '~해야 합니다' 등)은 쓰지 말 것\n"
-                "- 톤은 유머러스하고 적당히 귀엽게, 맨 끝에 짧은 응원 한마디로 마무리(예: 화이팅! 🌱)\n"
+                "- 톤은 유머러스하고 적당히 귀엽게, 추론 맨 끝에 짧은 응원 한마디로 마무리(예: 화이팅! 🌱)\n"
                 "- 근거가 부족하면 '근거가 조금 부족해요' 정도로 부드럽게 밝히고 추정을 덧붙일 것\n"
-                "추론 결과만 출력:\n\n"
+                "위 두 줄 외의 다른 말은 출력하지 마:\n\n"
                 + material
             ),
         )
-        return (getattr(resp, "text", "") or "").strip() or None
+        return _parse_topic_inference(getattr(resp, "text", "") or "")
     except Exception as exc:  # 네트워크/인증 등 실패해도 리마인드는 계속
         log.warning("Gemini 추론 실패: %s", exc)
-        return None
+        return None, None
 
 
 async def send_reminder(item: TrackedMessage) -> bool:
@@ -318,36 +336,30 @@ async def send_reminder(item: TrackedMessage) -> bool:
 
     # 스레드 대화가 핵심 근거. 스레드에 사람 대화가 있으면 그것만 쓰고,
     # 비어 있을 때만(주로 스레드 갓 생성됨) 아래 주변 메시지로 폴백한다.
+    # 이 맥락들은 LLM 추론의 '재료'로만 쓰고, 리마인드에 그대로 복붙하지 않는다.
     thread_context = await build_thread_context(item)
     if thread_context:
         channel_context = ""  # 스레드가 있으면 주변 채널 조회 자체를 생략
-        display_context = thread_context
-        display_name = "🧵 스레드 내용"
     else:
         channel_context = await build_context(message)
-        display_context = channel_context
-        display_name = "맥락(주변 메시지)"
-    inference = await infer_task_with_llm(thread_context, channel_context)
+    topic, inference = await infer_task_with_llm(thread_context, channel_context)
+
+    # 토픽 폴백: LLM 이 없거나 실패하면 원본 내용을 한 줄로 압축해 제목으로 쓴다.
+    if not topic:
+        original_line = (message.content or "").strip().replace("\n", " ")
+        topic = (original_line[:80] + ("…" if len(original_line) > 80 else "")) or "_(제목 없음)_"
+
     urgent = item.is_urgent
 
     embed = discord.Embed(
         title=("🔥 급한 미완료 작업" if urgent else "⭐ 미완료 작업 리마인드"),
-        description=(
-            f"아직 완료(⚡️)되지 않은 건입니다.\n"
-            f"[원본 메시지로 이동]({message.jump_url})"
-        ),
+        description="아직 완료(⚡️)되지 않은 건입니다.",
         color=discord.Color.red() if urgent else discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
     )
-    original = (message.content or "").strip() or "_(내용 없음)_"
-    embed.add_field(
-        name="원본",
-        value=f"**{message.author.display_name}**: {original[:1000]}",
-        inline=False,
-    )
+    embed.add_field(name="📌 토픽", value=topic[:256], inline=False)
     if inference:  # LLM 이 맥락으로부터 추론한 '해야 할 일'
         embed.add_field(name="🤖 AI 맥락 추론", value=inference[:1000], inline=False)
-    embed.add_field(name=display_name, value=clip_tail(display_context, 1000), inline=False)
     footer = "완료되면 원본 메시지에 ⚡️ 를 달아주세요."
     if inference:
         footer += " · AI 추론은 참고용입니다."
