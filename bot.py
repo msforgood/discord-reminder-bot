@@ -130,8 +130,8 @@ def emoji_kind(raw: str) -> Optional[str]:
     return None
 
 
-def make_thread_name(message: discord.Message) -> str:
-    content = (message.content or "").strip().replace("\n", " ")
+def make_thread_name(message: discord.Message, topic: Optional[str] = None) -> str:
+    content = (topic or "").strip() or (message.content or "").strip().replace("\n", " ")
     if not content:
         content = f"{message.author.display_name} 의 메시지"
     name = f"📌 {content}"
@@ -145,10 +145,13 @@ async def resolve_channel(channel_id: int):
     return ch
 
 
-async def get_or_create_thread(message: discord.Message) -> Optional[discord.Thread]:
+async def get_or_create_thread(
+    message: discord.Message, topic: Optional[str] = None
+) -> Optional[discord.Thread]:
     """
     - 메시지가 이미 스레드 안에 있으면 그 스레드를 반환
     - 아니면 메시지에 스레드를 만들어(또는 이미 있으면 재사용) 반환
+    - topic 이 주어지면 새로 만드는 스레드 제목으로 사용한다.
     """
     channel = message.channel
     if isinstance(channel, discord.Thread):
@@ -159,7 +162,7 @@ async def get_or_create_thread(message: discord.Message) -> Optional[discord.Thr
 
     try:
         return await message.create_thread(
-            name=make_thread_name(message),
+            name=make_thread_name(message, topic),
             auto_archive_duration=THREAD_AUTO_ARCHIVE_MINUTES,
         )
     except discord.HTTPException as exc:
@@ -170,6 +173,7 @@ async def get_or_create_thread(message: discord.Message) -> Optional[discord.Thr
 async def send_thread_opening_notice(
     thread: discord.Thread,
     item: "TrackedMessage",
+    topic: Optional[str] = None,
 ) -> None:
     """
     스레드를 갓 만든 직후, 사이드바의 '활성 스레드'에 바로 뜨도록 첫 메시지를 보낸다.
@@ -182,6 +186,8 @@ async def send_thread_opening_notice(
         color=discord.Color.red() if urgent else discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
     )
+    if topic:
+        embed.add_field(name="📌 토픽", value=topic[:256], inline=False)
     embed.set_footer(text="정기 리마인드는 정해진 시각(09/13/16시, KST)에 이 스레드로 전달됩니다.")
     try:
         await thread.send(embed=embed)
@@ -313,6 +319,20 @@ async def infer_task_with_llm(
     except Exception as exc:  # 네트워크/인증 등 실패해도 리마인드는 계속
         log.warning("Gemini 추론 실패: %s", exc)
         return None, None
+
+
+async def compute_topic(message: discord.Message) -> str:
+    """
+    등록 시점의 '주제 한 줄'. 아직 스레드 대화가 없으므로 채널 주변 맥락으로
+    LLM 이 압축하고, LLM 이 없거나 실패하면 원본 내용을 줄여서 쓴다.
+    스레드 제목과 등록 알림에 함께 쓰인다.
+    """
+    channel_context = await build_context(message)
+    topic, _ = await infer_task_with_llm("", channel_context)
+    if not topic:
+        original_line = (message.content or "").strip().replace("\n", " ")
+        topic = (original_line[:80] + ("…" if len(original_line) > 80 else "")) or "미완료 작업"
+    return topic
 
 
 async def send_reminder(item: TrackedMessage) -> bool:
@@ -457,13 +477,15 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if kind == "star":
         item.has_star = True
         newly_created = item.thread_id is None  # 이번에 처음 스레드를 붙이는가
-        thread = await get_or_create_thread(message)
+        # 새로 여는 건이면 주제 한 줄을 먼저 뽑아 스레드 제목·등록 알림에 함께 쓴다.
+        topic = await compute_topic(message) if newly_created else None
+        thread = await get_or_create_thread(message, topic)
         if thread is not None:
             item.thread_id = thread.id
             # 스레드는 메시지가 하나라도 있어야 사이드바의 '활성 스레드'에 뜬다.
             # 방금 새로 만든 경우에만 첫 메시지를 보내 활성 상태로 노출시킨다.
             if newly_created:
-                await send_thread_opening_notice(thread, item)
+                await send_thread_opening_notice(thread, item, topic)
         log.info("⭐ 등록: message %s", payload.message_id)
 
     elif kind == "lightning":
