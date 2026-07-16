@@ -169,7 +169,6 @@ async def get_or_create_thread(message: discord.Message) -> Optional[discord.Thr
 
 async def send_thread_opening_notice(
     thread: discord.Thread,
-    message: discord.Message,
     item: "TrackedMessage",
 ) -> None:
     """
@@ -182,12 +181,6 @@ async def send_thread_opening_notice(
         description="이 건을 여기서 챙길게요. 완료되면 원본 메시지에 ⚡️ 를 달아주세요.",
         color=discord.Color.red() if urgent else discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
-    )
-    original = (message.content or "").strip() or "_(내용 없음)_"
-    embed.add_field(
-        name="원본",
-        value=f"**{message.author.display_name}**: {original[:1000]}",
-        inline=False,
     )
     embed.set_footer(text="정기 리마인드는 정해진 시각(09/13/16시, KST)에 이 스레드로 전달됩니다.")
     try:
@@ -470,7 +463,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             # 스레드는 메시지가 하나라도 있어야 사이드바의 '활성 스레드'에 뜬다.
             # 방금 새로 만든 경우에만 첫 메시지를 보내 활성 상태로 노출시킨다.
             if newly_created:
-                await send_thread_opening_notice(thread, message, item)
+                await send_thread_opening_notice(thread, item)
         log.info("⭐ 등록: message %s", payload.message_id)
 
     elif kind == "lightning":
