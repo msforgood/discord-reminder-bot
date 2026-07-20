@@ -49,6 +49,9 @@ DAILY_REMIND_TIMES = [
 ]
 # 🔥 급한 건 반복 주기(시간)
 URGENT_REMIND_INTERVAL_HOURS = 2
+# 주말·공휴일에는 정기 리마인드를 🔥(급한 건)에만 보낸다.
+# (급한 건은 urgent_reminder_loop 로 평소처럼 반복 리마인드된다)
+WEEKEND_HOLIDAY_URGENT_ONLY = True
 # 새로 만든 스레드 자동 보관까지의 시간(분). 60/1440/4320/10080 중 하나.
 THREAD_AUTO_ARCHIVE_MINUTES = 10080  # 7일
 # 리마인드에 함께 보여줄 앞뒤 맥락 메시지 수
@@ -143,6 +146,38 @@ async def resolve_channel(channel_id: int):
     if ch is None:
         ch = await bot.fetch_channel(channel_id)
     return ch
+
+
+# 연도별 한국 공휴일 캐시(datetime.date -> 공휴일명). 최초 조회 시 채운다.
+_kr_holidays_cache: dict[int, object] = {}
+
+
+def _kr_holidays_for(year: int):
+    """해당 연도의 한국 공휴일 객체를 반환한다. holidays 미설치면 None."""
+    if year in _kr_holidays_cache:
+        return _kr_holidays_cache[year]
+    try:
+        import holidays  # 지연 임포트: 미설치여도 봇은 동작(주말만 판정)
+    except ImportError:
+        _kr_holidays_cache[year] = None
+        return None
+    obj = holidays.SouthKorea(years=year)
+    _kr_holidays_cache[year] = obj
+    return obj
+
+
+def is_rest_day(now: Optional[datetime] = None) -> tuple[bool, str]:
+    """
+    지금(KST)이 주말 또는 한국 공휴일이면 (True, 사유)를 반환한다.
+    holidays 미설치 시 공휴일 판정은 생략하고 주말만 본다.
+    """
+    dt = (now or datetime.now(KST)).astimezone(KST)
+    if dt.weekday() >= 5:  # 5=토, 6=일
+        return True, "주말"
+    kr = _kr_holidays_for(dt.year)
+    if kr is not None and dt.date() in kr:
+        return True, str(kr.get(dt.date()) or "공휴일")
+    return False, ""
 
 
 async def get_or_create_thread(
@@ -537,9 +572,16 @@ async def _before_urgent():
 
 @tasks.loop(time=DAILY_REMIND_TIMES)
 async def daily_reminder_loop():
+    # 주말·공휴일에는 🔥(급한 건)만 리마인드한다. 나머지는 다음 평일까지 쉰다.
+    rest_day, reason = (is_rest_day() if WEEKEND_HOLIDAY_URGENT_ONLY else (False, ""))
+    if rest_day:
+        log.info("정기 리마인드: %s → 🔥 급한 건만 전송", reason)
     for item in list(tracked.values()):
-        if item.is_active:   # 급한 건 포함 모든 미완료 건 정해진 시각마다
-            await send_reminder(item)
+        if not item.is_active:
+            continue
+        if rest_day and not item.is_urgent:
+            continue  # 주말·공휴일에는 급하지 않은 건 건너뜀
+        await send_reminder(item)
 
 
 @daily_reminder_loop.before_loop

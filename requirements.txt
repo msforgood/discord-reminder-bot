@@ -1,4 +1,6 @@
 discord.py>=2.3
 python-dotenv>=1.0
+# 주말·공휴일(한국) 판정용: 공휴일에는 🔥 급한 건만 리마인드
+holidays>=0.40
 # 선택: 맥락 요약(USE_LLM_SUMMARY=True)에만 필요 (Gemini 무료 티어)
 google-genai>=1.0
