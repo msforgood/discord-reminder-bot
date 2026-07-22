@@ -13,7 +13,8 @@
 - ⚡️ 가 붙으면 완료 처리하고 리마인드 중단
 
 상태는 메모리에만 저장한다(봇 재시작 시 초기화). 재시작 후에는
-채널에서 `!scan` 을 실행하면 최근 메시지의 ⭐️/⚡️ 를 다시 읽어들인다.
+`!scan`(현재 채널) 또는 `!scan all`(이 서버 전체)을 실행하면
+최근 메시지의 ⭐️/⚡️ 를 다시 읽어들인다.
 """
 
 import os
@@ -588,11 +589,10 @@ async def _before_daily():
 # ---------------------------------------------------------------------------
 # 명령어
 # ---------------------------------------------------------------------------
-@bot.command(name="scan")
-async def scan(ctx: commands.Context):
-    """현재 채널의 최근 메시지에서 ⭐️/⚡️/🔥 를 다시 읽어 등록한다(재시작 후 복구용)."""
+async def scan_channel(channel, guild_id: int) -> int:
+    """한 채널의 최근 메시지에서 ⭐️/⚡️/🔥 를 읽어 등록한다. 새로 잡힌 미완료 건 수를 반환."""
     found = 0
-    async for message in ctx.channel.history(limit=SCAN_HISTORY_LIMIT):
+    async for message in channel.history(limit=SCAN_HISTORY_LIMIT):
         kinds = set()
         for reaction in message.reactions:
             k = emoji_kind(str(reaction.emoji))
@@ -604,7 +604,7 @@ async def scan(ctx: commands.Context):
         item = tracked.get(message.id) or TrackedMessage(
             message_id=message.id,
             channel_id=message.channel.id,
-            guild_id=ctx.guild.id if ctx.guild else 0,
+            guild_id=guild_id,
         )
         item.has_star = True
         item.has_lightning = "lightning" in kinds
@@ -616,8 +616,61 @@ async def scan(ctx: commands.Context):
         tracked[message.id] = item
         if item.is_active:
             found += 1
+    return found
 
-    await ctx.send(f"🔎 스캔 완료. 미완료 건 {found}개를 등록했습니다.")
+
+def scannable_channels(guild: discord.Guild) -> list:
+    """이 서버에서 봇이 실제로 과거 메시지를 읽을 수 있는 텍스트 채널들."""
+    me = guild.me
+    if me is None:
+        return []
+    channels = []
+    for channel in list(guild.text_channels) + list(guild.voice_channels):
+        perms = channel.permissions_for(me)
+        if perms.view_channel and perms.read_message_history:
+            channels.append(channel)
+    return channels
+
+
+@bot.command(name="scan")
+async def scan(ctx: commands.Context, scope: str = ""):
+    """
+    최근 메시지에서 ⭐️/⚡️/🔥 를 다시 읽어 등록한다(재시작 후 복구용).
+
+    - `!scan`     : 현재 채널만
+    - `!scan all` : 이 서버에서 봇이 읽을 수 있는 모든 채널
+
+    범위는 명령을 실행한 '이 서버'로 한정한다. 여러 서버를 한 번에 훑는 건
+    의도치 않은 스레드 대량 생성으로 이어질 수 있어 지원하지 않는다.
+    """
+    if scope.lower() != "all":
+        found = await scan_channel(ctx.channel, ctx.guild.id if ctx.guild else 0)
+        await ctx.send(f"🔎 스캔 완료. 미완료 건 {found}개를 등록했습니다.")
+        return
+
+    if ctx.guild is None:
+        await ctx.send("`!scan all` 은 서버 채널에서만 쓸 수 있습니다.")
+        return
+
+    channels = scannable_channels(ctx.guild)
+    if not channels:
+        await ctx.send("읽을 수 있는 채널이 없습니다. (채널 보기/기록 읽기 권한을 확인해주세요)")
+        return
+
+    status = await ctx.send(f"🔎 이 서버의 채널 {len(channels)}개 스캔 중… (조금 걸릴 수 있어요)")
+    found = 0
+    failed = 0
+    for channel in channels:
+        try:
+            found += await scan_channel(channel, ctx.guild.id)
+        except discord.HTTPException as exc:  # 권한 변경/레이트리밋 등은 건너뛴다
+            failed += 1
+            log.warning("스캔 실패 (channel %s): %s", channel.id, exc)
+
+    msg = f"🔎 스캔 완료. 채널 {len(channels) - failed}개에서 미완료 건 {found}개를 등록했습니다."
+    if failed:
+        msg += f"\n⚠️ {failed}개 채널은 권한/오류로 건너뛰었습니다."
+    await status.edit(content=msg)
 
 
 def jump_url_for(item: TrackedMessage) -> str:
