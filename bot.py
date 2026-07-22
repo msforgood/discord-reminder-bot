@@ -399,22 +399,18 @@ async def send_reminder(item: TrackedMessage) -> bool:
 
     urgent = item.is_urgent
 
-    embed = discord.Embed(
-        title=("🔥 급한 미완료 작업" if urgent else "⭐ 미완료 작업 리마인드"),
-        description="아직 완료(⚡️)되지 않은 건입니다.",
-        color=discord.Color.red() if urgent else discord.Color.gold(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="📌 토픽", value=topic[:256], inline=False)
-    if inference:  # LLM 이 맥락으로부터 추론한 '해야 할 일'
-        embed.add_field(name="🤖 AI 맥락 추론", value=inference[:1000], inline=False)
-    footer = "완료되면 원본 메시지에 ⚡️ 를 달아주세요."
+    # 푸시 알림 미리보기에는 embed 가 아니라 '메시지 본문'만 노출된다(embed 는 첨부 취급).
+    # 그래서 매번 똑같은 안내 문구 대신, AI 가 추론한 내용을 본문으로 보낸다.
+    body = inference or "아직 완료(⚡️)되지 않은 건입니다."
+    head = f"{'🔥' if urgent else '⭐'} **{topic[:120]}**"
+    content = f"{head}\n{body}"
+    tail = "\n-# 완료되면 원본 메시지에 ⚡️ 를 달아주세요."
     if inference:
-        footer += " · AI 추론은 참고용입니다."
-    embed.set_footer(text=footer)
+        tail = "\n-# 완료되면 원본 메시지에 ⚡️ 를 달아주세요. · AI 추론은 참고용입니다."
+    content = content[: 2000 - len(tail)] + tail
 
     try:
-        await thread.send(embed=embed)
+        await thread.send(content)
         item.last_reminded = datetime.now(timezone.utc)
         return True
     except discord.HTTPException as exc:
