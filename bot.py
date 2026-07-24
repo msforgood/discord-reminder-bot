@@ -4,11 +4,13 @@
 - ⭐️  : 확인은 했지만 추후 작업 필요 (미완료)
 - ⚡️  : 작업 완료
 - 🔥  : 급한 건
+- 👋  : 보류 (매주 월요일 09시에만 리마인드)
 
 동작
 - ⭐️ 있고 ⚡️ 없는 메시지 → 스레드 생성(없으면) 후 그 스레드에서 리마인드
 - 메시지가 이미 스레드 안에 있으면 → 그 스레드에서 리마인드
 - 🔥 붙은 급한 건 → 자주 리마인드 / 나머지 → 하루 1회
+- 👋 붙은 보류 건 → 다른 리마인드는 모두 멈추고 매주 월요일 09시에만 리마인드
 - 리마인드 시 원본/주변 맥락을 그대로 복붙하지 않고, 압축된 토픽 한 줄 + AI 맥락 추론만 보여줌
 - ⚡️ 가 붙으면 완료 처리하고 리마인드 중단
 
@@ -35,10 +37,11 @@ from dotenv import load_dotenv
 load_dotenv()  # 같은 디렉터리의 .env 파일에서 환경변수를 읽어온다
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 
-# 이모지 (변형 선택자 U+FE0F 는 비교 시 무시한다)
+# 이모지 (변형 선택자 U+FE0F, 피부톤 수식자는 비교 시 무시한다)
 STAR = "⭐"
 LIGHTNING = "⚡"
 FIRE = "🔥"
+WAVE = "👋"  # 보류 (👋🏻 등 피부톤이 붙어도 같게 취급)
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -50,6 +53,10 @@ DAILY_REMIND_TIMES = [
 ]
 # 🔥 급한 건 반복 주기(시간)
 URGENT_REMIND_INTERVAL_HOURS = 2
+# 👋 보류 건 리마인드: 매주 월요일 09시(KST) 한 번만.
+# (아래 시각은 반드시 DAILY_REMIND_TIMES 안에 있어야 한다 — 그 슬롯에서 함께 처리된다)
+HOLD_REMIND_WEEKDAY = 0   # 0=월요일
+HOLD_REMIND_HOUR = 9
 # 주말·공휴일에는 정기 리마인드를 🔥(급한 건)에만 보낸다.
 # (급한 건은 urgent_reminder_loop 로 평소처럼 반복 리마인드된다)
 WEEKEND_HOLIDAY_URGENT_ONLY = True
@@ -100,6 +107,7 @@ class TrackedMessage:
     has_star: bool = False
     has_lightning: bool = False
     is_urgent: bool = False
+    is_on_hold: bool = False          # 👋 보류: 월요일 09시에만 리마인드
     last_reminded: Optional[datetime] = field(default=None)
 
     @property
@@ -119,8 +127,14 @@ _startup_notified = False
 # 헬퍼
 # ---------------------------------------------------------------------------
 def normalize_emoji(raw: str) -> str:
-    """변형 선택자(U+FE0F)를 제거해 ⭐ 과 ⭐️ 를 같게 취급한다."""
-    return raw.replace("\uFE0F", "")
+    """
+    변형 선택자(U+FE0F)와 피부톤 수식자(U+1F3FB~U+1F3FF)를 제거한다.
+    ⭐ == ⭐️, 👋 == 👋🏻 == 👋🏽 처럼 같은 이모지로 취급하기 위함이다.
+    """
+    out = raw.replace("\uFE0F", "")
+    for tone in range(0x1F3FB, 0x1F400):
+        out = out.replace(chr(tone), "")
+    return out
 
 
 def emoji_kind(raw: str) -> Optional[str]:
@@ -131,7 +145,15 @@ def emoji_kind(raw: str) -> Optional[str]:
         return "lightning"
     if e == FIRE:
         return "fire"
+    if e == WAVE:
+        return "wave"
     return None
+
+
+def is_hold_remind_slot(now: Optional[datetime] = None) -> bool:
+    """지금이 👋 보류 건을 리마인드할 슬롯(매주 월요일 09시, KST)인가."""
+    dt = (now or datetime.now(KST)).astimezone(KST)
+    return dt.weekday() == HOLD_REMIND_WEEKDAY and dt.hour == HOLD_REMIND_HOUR
 
 
 def make_thread_name(message: discord.Message, topic: Optional[str] = None) -> str:
@@ -209,7 +231,6 @@ async def get_or_create_thread(
 async def send_thread_opening_notice(
     thread: discord.Thread,
     item: "TrackedMessage",
-    topic: Optional[str] = None,
 ) -> None:
     """
     스레드를 갓 만든 직후, 사이드바의 '활성 스레드'에 바로 뜨도록 첫 메시지를 보낸다.
@@ -222,8 +243,6 @@ async def send_thread_opening_notice(
         color=discord.Color.red() if urgent else discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
     )
-    if topic:
-        embed.add_field(name="📌 토픽", value=topic[:256], inline=False)
     embed.set_footer(text="정기 리마인드는 정해진 시각(09/13/16시, KST)에 이 스레드로 전달됩니다.")
     try:
         await thread.send(embed=embed)
@@ -361,7 +380,7 @@ async def compute_topic(message: discord.Message) -> str:
     """
     등록 시점의 '주제 한 줄'. 아직 스레드 대화가 없으므로 채널 주변 맥락으로
     LLM 이 압축하고, LLM 이 없거나 실패하면 원본 내용을 줄여서 쓴다.
-    스레드 제목과 등록 알림에 함께 쓰인다.
+    새 스레드 제목을 만들 때만 쓰인다.
     """
     channel_context = await build_context(message)
     topic, _ = await infer_task_with_llm("", channel_context)
@@ -391,23 +410,20 @@ async def send_reminder(item: TrackedMessage) -> bool:
         channel_context = ""  # 스레드가 있으면 주변 채널 조회 자체를 생략
     else:
         channel_context = await build_context(message)
-    topic, inference = await infer_task_with_llm(thread_context, channel_context)
-
-    # 토픽 폴백: LLM 이 없거나 실패하면 원본 내용을 한 줄로 압축해 제목으로 쓴다.
-    if not topic:
-        original_line = (message.content or "").strip().replace("\n", " ")
-        topic = (original_line[:80] + ("…" if len(original_line) > 80 else "")) or "_(제목 없음)_"
+    # 토픽은 스레드 제목을 만들 때만 쓰고, 리마인드 본문에는 넣지 않는다.
+    _, inference = await infer_task_with_llm(thread_context, channel_context)
 
     urgent = item.is_urgent
 
     # 푸시 알림 미리보기에는 embed 가 아니라 '메시지 본문'만 노출된다(embed 는 첨부 취급).
-    # 그래서 매번 똑같은 안내 문구 대신, AI 가 추론한 내용을 본문으로 보낸다.
-    body = inference or "아직 완료(⚡️)되지 않은 건입니다."
-    head = f"{'🔥' if urgent else '⭐'} **{topic[:120]}**"
-    content = f"{head}\n{body}"
+    # 그래서 매번 똑같은 안내 문구 대신, AI 가 추론한 내용(+응원)만 본문으로 보낸다.
+    head = "👋" if item.is_on_hold else ("🔥" if urgent else "⭐")
     tail = "\n-# 완료되면 원본 메시지에 ⚡️ 를 달아주세요."
+    if item.is_on_hold:
+        tail = "\n-# 👋 보류 중인 건이라 매주 월요일에만 알려드려요. 완료되면 ⚡️ 를 달아주세요."
     if inference:
-        tail = "\n-# 완료되면 원본 메시지에 ⚡️ 를 달아주세요. · AI 추론은 참고용입니다."
+        tail += " · AI 추론은 참고용입니다."
+    content = (f"{head} {inference}" if inference else head)
     content = content[: 2000 - len(tail)] + tail
 
     try:
@@ -509,7 +525,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if kind == "star":
         item.has_star = True
         newly_created = item.thread_id is None  # 이번에 처음 스레드를 붙이는가
-        # 새로 여는 건이면 주제 한 줄을 먼저 뽑아 스레드 제목·등록 알림에 함께 쓴다.
+        # 새로 여는 건이면 주제 한 줄을 먼저 뽑아 스레드 제목으로만 쓴다.
         topic = await compute_topic(message) if newly_created else None
         thread = await get_or_create_thread(message, topic)
         if thread is not None:
@@ -517,7 +533,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             # 스레드는 메시지가 하나라도 있어야 사이드바의 '활성 스레드'에 뜬다.
             # 방금 새로 만든 경우에만 첫 메시지를 보내 활성 상태로 노출시킨다.
             if newly_created:
-                await send_thread_opening_notice(thread, item, topic)
+                await send_thread_opening_notice(thread, item)
         log.info("⭐ 등록: message %s", payload.message_id)
 
     elif kind == "lightning":
@@ -533,6 +549,19 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     elif kind == "fire":
         item.is_urgent = True
         log.info("🔥 급함: message %s", payload.message_id)
+
+    elif kind == "wave":
+        item.is_on_hold = True
+        log.info("👋 보류: message %s", payload.message_id)
+        if item.thread_id is not None:
+            try:
+                thread = await resolve_channel(item.thread_id)
+                await thread.send(
+                    "👋 **보류로 전환되었습니다.** 정기·급한 건 리마인드는 멈추고, "
+                    "매주 월요일 09시(KST)에만 한 번 알려드릴게요."
+                )
+            except discord.HTTPException:
+                pass
 
 
 @bot.event
@@ -550,6 +579,8 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         item.has_lightning = False   # 완료 취소 → 다시 리마인드 대상
     elif kind == "fire":
         item.is_urgent = False
+    elif kind == "wave":
+        item.is_on_hold = False      # 보류 해제 → 평소 리마인드로 복귀
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +589,8 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 @tasks.loop(hours=URGENT_REMIND_INTERVAL_HOURS)
 async def urgent_reminder_loop():
     for item in list(tracked.values()):
-        if item.is_active and item.is_urgent:
+        # 👋 보류는 🔥 보다 우선한다 — 급한 건이어도 보류면 여기서 보내지 않는다.
+        if item.is_active and item.is_urgent and not item.is_on_hold:
             await send_reminder(item)
 
 
@@ -573,10 +605,19 @@ async def daily_reminder_loop():
     rest_day, reason = (is_rest_day() if WEEKEND_HOLIDAY_URGENT_ONLY else (False, ""))
     if rest_day:
         log.info("정기 리마인드: %s → 🔥 급한 건만 전송", reason)
+    # 👋 보류 건은 이 슬롯이 월요일 09시일 때만 함께 전송한다.
+    hold_slot = is_hold_remind_slot()
+    if hold_slot:
+        log.info("정기 리마인드: 월요일 09시 → 👋 보류 건도 함께 전송")
     for item in list(tracked.values()):
         if not item.is_active:
             continue
-        if rest_day and not item.is_urgent:
+        if item.is_on_hold:
+            # 보류 건은 월요일 09시에만. 그 월요일이 공휴일이면 쉬는 날 정책을 따라
+            # 건너뛰고 다음 주 월요일에 알린다.
+            if not hold_slot or rest_day:
+                continue
+        elif rest_day and not item.is_urgent:
             continue  # 주말·공휴일에는 급하지 않은 건 건너뜀
         await send_reminder(item)
 
@@ -590,7 +631,7 @@ async def _before_daily():
 # 명령어
 # ---------------------------------------------------------------------------
 async def scan_channel(channel, guild_id: int) -> int:
-    """한 채널의 최근 메시지에서 ⭐️/⚡️/🔥 를 읽어 등록한다. 새로 잡힌 미완료 건 수를 반환."""
+    """한 채널의 최근 메시지에서 ⭐️/⚡️/🔥/👋 를 읽어 등록한다. 새로 잡힌 미완료 건 수를 반환."""
     found = 0
     async for message in channel.history(limit=SCAN_HISTORY_LIMIT):
         kinds = set()
@@ -609,6 +650,7 @@ async def scan_channel(channel, guild_id: int) -> int:
         item.has_star = True
         item.has_lightning = "lightning" in kinds
         item.is_urgent = "fire" in kinds
+        item.is_on_hold = "wave" in kinds
         if item.is_active and item.thread_id is None:
             thread = await get_or_create_thread(message)
             if thread is not None:
@@ -683,7 +725,7 @@ def jump_url_for(item: TrackedMessage) -> str:
 
 async def describe_item(item: TrackedMessage) -> str:
     """미완료 건을 사람이 알아볼 수 있게: 태그 + 내용 미리보기 + 원본 링크."""
-    tag = "🔥" if item.is_urgent else "⭐"
+    tag = "👋" if item.is_on_hold else ("🔥" if item.is_urgent else "⭐")
     try:
         channel = await resolve_channel(item.channel_id)
         message = await channel.fetch_message(item.message_id)
@@ -722,13 +764,21 @@ async def pending(ctx: commands.Context):
 
 @bot.command(name="remind")
 async def remind(ctx: commands.Context):
-    """정기 시각을 기다리지 않고 지금 당장 모든 미완료 건에 리마인드를 보낸다."""
-    active = active_items_for(ctx)
+    """정기 시각을 기다리지 않고 지금 당장 미완료 건에 리마인드를 보낸다(👋 보류 제외)."""
+    all_active = active_items_for(ctx)
+    active = [i for i in all_active if not i.is_on_hold]
+    on_hold = len(all_active) - len(active)
     if not active:
-        await ctx.send("지금 리마인드할 미완료 건이 없습니다. ✨")
+        msg = "지금 리마인드할 미완료 건이 없습니다. ✨"
+        if on_hold:
+            msg += f" (👋 보류 {on_hold}건은 월요일 09시에만 알려드려요)"
+        await ctx.send(msg)
         return
 
-    await ctx.send(f"🔔 미완료 {len(active)}건에 대해 지금 리마인드를 보냅니다…")
+    notice = f"🔔 미완료 {len(active)}건에 대해 지금 리마인드를 보냅니다…"
+    if on_hold:
+        notice += f"\n👋 보류 {on_hold}건은 제외했습니다."
+    await ctx.send(notice)
     sent = 0
     skipped = 0
     for item in active:
