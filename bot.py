@@ -11,7 +11,7 @@
 - 메시지가 이미 스레드 안에 있으면 → 그 스레드에서 리마인드
 - 🔥 붙은 급한 건 → 자주 리마인드 / 나머지 → 하루 1회
 - 👋 붙은 보류 건 → 다른 리마인드는 모두 멈추고 매주 월요일 09시에만 리마인드
-- 리마인드 시 원본/주변 맥락을 그대로 복붙하지 않고, 압축된 토픽 한 줄 + AI 맥락 추론만 보여줌
+- 리마인드 본문은 AI 맥락 추론 '한 덩어리'만 보냄 (토픽·안내 문구 없음, 원문 복붙 없음)
 - ⚡️ 가 붙으면 완료 처리하고 리마인드 중단
 
 상태는 메모리에만 저장한다(봇 재시작 시 초기화). 재시작 후에는
@@ -19,6 +19,7 @@
 최근 메시지의 ⭐️/⚡️ 를 다시 읽어들인다.
 """
 
+import asyncio
 import os
 import sys
 import logging
@@ -83,6 +84,9 @@ STARTUP_NOTIFY_CHANNEL_ID = os.environ.get("STARTUP_NOTIFY_CHANNEL_ID", "")
 # 주의: 무료 티어 입력은 Google 모델 학습에 사용될 수 있음.
 USE_LLM_SUMMARY = os.environ.get("USE_LLM_SUMMARY", "true").lower() in ("1", "true", "yes")
 LLM_MODEL = "gemini-2.5-flash"  # 무료 티어 지원 모델(Flash 계열)
+# 일시적 오류(429 레이트리밋 · 5xx · 네트워크)일 때 재시도 횟수와 첫 대기(초). 대기는 2배씩 늘어난다.
+LLM_RETRY_ATTEMPTS = 3
+LLM_RETRY_BACKOFF_SECONDS = 2.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("remind-bot")
@@ -322,23 +326,54 @@ def _parse_topic_inference(text: str) -> tuple[Optional[str], Optional[str]]:
     return topic, inference
 
 
+# 추론 실패 사유. 사유별로 리마인드에서 다르게 안내한다.
+FAIL_OFF = "off"                  # LLM 비활성/키 없음/패키지 미설치 (설정 문제 → 스레드에 안 알림)
+FAIL_NO_MATERIAL = "no_material"  # 참고할 대화 내용 자체가 없음
+FAIL_EMPTY = "empty"              # 응답은 왔는데 텍스트가 비어 있음
+FAIL_ERROR = "error"              # 재시도까지 했는데도 API 실패
+
+# 일시적 오류로 볼 만한 단서들(레이트리밋·5xx·네트워크). 인증/요청 오류는 재시도하지 않는다.
+_TRANSIENT_MARKERS = (
+    "resource_exhausted", "rate limit", "quota",
+    "unavailable", "overloaded", "internal error",
+    "deadline", "timeout", "timed out", "connection", "temporarily",
+)
+_PERMANENT_MARKERS = ("api key", "api_key", "unauthenticated", "permission", "invalid_argument", "not found")
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """재시도할 가치가 있는 일시적 오류인가."""
+    if isinstance(exc, (asyncio.TimeoutError, OSError)):  # ConnectionError/TimeoutError 포함
+        return True
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code == 429 or 500 <= code < 600
+    text = f"{type(exc).__name__} {exc}".lower()
+    if any(m in text for m in _PERMANENT_MARKERS):
+        return False
+    if any(str(c) in text for c in (429, 500, 502, 503, 504)):
+        return True
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
 async def infer_task_with_llm(
     thread_text: str, channel_text: str
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Gemini 로 '압축된 토픽 한 줄' + '무엇을/왜 처리해야 하는지 추론'을 만든다.
     스레드 대화가 있으면 그것을 최우선 근거로, 채널 주변 맥락은 보조로 삼는다.
-    반환: (토픽, 추론). 실패/비활성이면 (None, None).
+    반환: (토픽, 추론, 실패사유). 성공이면 실패사유는 None.
+    일시적 오류(429/5xx/네트워크)는 지수 백오프로 몇 번 다시 시도한다.
     """
     if not (USE_LLM_SUMMARY and os.environ.get("GEMINI_API_KEY")):
-        return None, None
-    # 스레드도 없고 채널 맥락도 못 불러왔으면 추론 불가
+        return None, None, FAIL_OFF
+    # 스레드도 없고 채널 맥락도 못 불러왔으면 추론할 재료가 없다
     if not thread_text and channel_text.startswith("_("):
-        return None, None
+        return None, None, FAIL_NO_MATERIAL
     try:
         from google import genai  # 지연 임포트: 미설치여도 봇은 동작
     except ImportError:
-        return None, None
+        return None, None, FAIL_OFF
 
     parts = []
     if thread_text:
@@ -350,30 +385,58 @@ async def infer_task_with_llm(
     parts.append("[채널 주변 맥락 — 보조 참고용]\n" + channel_text)
     material = "\n\n".join(parts)
 
+    prompt = (
+        "너는 다정한 업무 리마인드 도우미야. 아래 자료를 보고 담당자가 어떤 일을 하려던 건지 "
+        "정리해줘.\n"
+        "**스레드 대화가 있으면 그걸 가장 중요한 근거로 삼아** — 이 건의 실제 논의와 진행상황이 "
+        "담겨 있어. 채널 주변 맥락은 스레드가 비었을 때만 보조로 참고해.\n"
+        "출력은 정확히 아래 두 부분으로만:\n"
+        "토픽: <이 건이 무엇인지 한 줄로 압축한 제목. 30자 안팎의 명사구, 문장부호·따옴표 없이>\n"
+        "추론: <무엇을/왜/지금까지 진행된 부분/남은 부분을 상황 설명하듯 부드럽게 한국어 2~4문장>\n"
+        "- 원문 문장을 그대로 복붙하지 말고 맥락으로 의도를 해석할 것\n"
+        "- 추론 안에서 토픽을 다시 요약하거나 제목처럼 반복하지 말 것 "
+        "(토픽은 이미 스레드 제목으로 보인다)\n"
+        "- '아직 완료되지 않았다', '미완료 건이다', '리마인드입니다' 같은 뻔한 말은 쓰지 말 것\n"
+        "- 완료 처리 방법(이모지 달기 등) 안내도 쓰지 말 것\n"
+        "- 재촉하거나 압박하는 표현('빨리', '서둘러', '빠른 시일 내에', '~해야 합니다' 등)은 쓰지 말 것\n"
+        "- 톤은 유머러스하고 적당히 귀엽게, 추론 맨 끝에 짧은 응원 한마디로 마무리(예: 화이팅! 🌱)\n"
+        "- 근거가 부족하면 '근거가 조금 부족해요' 정도로 부드럽게 밝히고 추정을 덧붙일 것\n"
+        "위 두 줄 외의 다른 말은 출력하지 마:\n\n"
+        + material
+    )
+
+    for attempt in range(1, LLM_RETRY_ATTEMPTS + 1):
+        try:
+            client = genai.Client()  # 환경변수 GEMINI_API_KEY 사용
+            resp = await client.aio.models.generate_content(model=LLM_MODEL, contents=prompt)
+        except Exception as exc:  # 실패해도 봇은 계속 돈다
+            if attempt < LLM_RETRY_ATTEMPTS and _is_transient_llm_error(exc):
+                delay = LLM_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                log.warning(
+                    "Gemini 일시적 오류 (%d/%d), %.0f초 후 재시도: %s",
+                    attempt, LLM_RETRY_ATTEMPTS, delay, exc,
+                )
+                await asyncio.sleep(delay)
+                continue
+            log.warning("Gemini 추론 실패 (%d회 시도): %s", attempt, exc)
+            return None, None, FAIL_ERROR
+
+        topic, inference = _parse_topic_inference(getattr(resp, "text", "") or "")
+        if not inference:
+            # 응답 자체는 왔는데 텍스트가 비었다(안전 필터·비정상 종료 등)
+            log.warning("Gemini 빈 응답 (finish=%s)", _finish_reason_of(resp))
+            return topic, None, FAIL_EMPTY
+        return topic, inference, None
+
+    return None, None, FAIL_ERROR
+
+
+def _finish_reason_of(resp) -> str:
+    """빈 응답 원인 파악용. 구조가 달라도 예외 없이 문자열을 돌려준다."""
     try:
-        client = genai.Client()  # 환경변수 GEMINI_API_KEY 사용
-        resp = await client.aio.models.generate_content(
-            model=LLM_MODEL,
-            contents=(
-                "너는 다정한 업무 리마인드 도우미야. 아래 자료를 보고 담당자가 어떤 일을 하려던 건지 "
-                "정리해줘.\n"
-                "**스레드 대화가 있으면 그걸 가장 중요한 근거로 삼아** — 이 건의 실제 논의와 진행상황이 "
-                "담겨 있어. 채널 주변 맥락은 스레드가 비었을 때만 보조로 참고해.\n"
-                "출력은 정확히 아래 두 부분으로만:\n"
-                "토픽: <이 건이 무엇인지 한 줄로 압축한 제목. 30자 안팎의 명사구, 문장부호·따옴표 없이>\n"
-                "추론: <무엇을/왜/지금까지 진행된 부분/남은 부분을 상황 설명하듯 부드럽게 한국어 2~4문장>\n"
-                "- 원문 문장을 그대로 복붙하지 말고 맥락으로 의도를 해석할 것\n"
-                "- 재촉하거나 압박하는 표현('빨리', '서둘러', '빠른 시일 내에', '~해야 합니다' 등)은 쓰지 말 것\n"
-                "- 톤은 유머러스하고 적당히 귀엽게, 추론 맨 끝에 짧은 응원 한마디로 마무리(예: 화이팅! 🌱)\n"
-                "- 근거가 부족하면 '근거가 조금 부족해요' 정도로 부드럽게 밝히고 추정을 덧붙일 것\n"
-                "위 두 줄 외의 다른 말은 출력하지 마:\n\n"
-                + material
-            ),
-        )
-        return _parse_topic_inference(getattr(resp, "text", "") or "")
-    except Exception as exc:  # 네트워크/인증 등 실패해도 리마인드는 계속
-        log.warning("Gemini 추론 실패: %s", exc)
-        return None, None
+        return str(resp.candidates[0].finish_reason)
+    except Exception:
+        return "unknown"
 
 
 async def compute_topic(message: discord.Message) -> str:
@@ -383,7 +446,7 @@ async def compute_topic(message: discord.Message) -> str:
     새 스레드 제목을 만들 때만 쓰인다.
     """
     channel_context = await build_context(message)
-    topic, _ = await infer_task_with_llm("", channel_context)
+    topic, _, _ = await infer_task_with_llm("", channel_context)
     if not topic:
         original_line = (message.content or "").strip().replace("\n", " ")
         topic = (original_line[:80] + ("…" if len(original_line) > 80 else "")) or "미완료 작업"
@@ -411,20 +474,22 @@ async def send_reminder(item: TrackedMessage) -> bool:
     else:
         channel_context = await build_context(message)
     # 토픽은 스레드 제목을 만들 때만 쓰고, 리마인드 본문에는 넣지 않는다.
-    _, inference = await infer_task_with_llm(thread_context, channel_context)
-
-    urgent = item.is_urgent
+    _, inference, fail_reason = await infer_task_with_llm(thread_context, channel_context)
 
     # 푸시 알림 미리보기에는 embed 가 아니라 '메시지 본문'만 노출된다(embed 는 첨부 취급).
-    # 그래서 매번 똑같은 안내 문구 대신, AI 가 추론한 내용(+응원)만 본문으로 보낸다.
-    head = "👋" if item.is_on_hold else ("🔥" if urgent else "⭐")
-    tail = "\n-# 완료되면 원본 메시지에 ⚡️ 를 달아주세요."
-    if item.is_on_hold:
-        tail = "\n-# 👋 보류 중인 건이라 매주 월요일에만 알려드려요. 완료되면 ⚡️ 를 달아주세요."
+    # 본문은 AI 추론 내용'만' 보낸다 — 토픽/안내 문구/미완료라는 당연한 얘기는 넣지 않는다.
+    # 추론을 못 만들었으면 사유를 한 줄로만 알린다.
     if inference:
-        tail += " · AI 추론은 참고용입니다."
-    content = (f"{head} {inference}" if inference else head)
-    content = content[: 2000 - len(tail)] + tail
+        content = inference[:2000]
+    elif fail_reason == FAIL_NO_MATERIAL:
+        content = "내용이 없어서 AI 추론에 실패했어요."
+    elif fail_reason == FAIL_EMPTY:
+        content = "AI가 제대로 된 추론을 생성하지 못했어요."
+    elif fail_reason == FAIL_ERROR:
+        content = "AI 추론 요청이 계속 실패해서 이번엔 내용을 만들지 못했어요."
+    else:  # FAIL_OFF: 키·패키지 등 설정 문제라 스레드에 알릴 내용이 아니다
+        log.info("LLM 비활성 → 리마인드 생략 (message %s)", item.message_id)
+        return False
 
     try:
         await thread.send(content)
@@ -785,12 +850,15 @@ async def remind(ctx: commands.Context):
         if await send_reminder(item):
             sent += 1
         else:
-            # 스레드가 아직 없거나(스레드 생성 실패) 원본을 못 찾은 경우
+            # 스레드/원본을 못 찾았거나, AI 기능이 꺼져 있는 경우
             skipped += 1
 
     msg = f"✅ 리마인드 전송 완료: {sent}건 (각 건의 스레드로 전송)"
     if skipped:
-        msg += f"\n⚠️ {skipped}건은 스레드가 없거나 원본을 찾지 못해 건너뛰었습니다."
+        msg += (
+            f"\n⚠️ {skipped}건은 스레드·원본을 찾지 못했거나 AI 기능이 꺼져 있어 "
+            f"건너뛰었습니다."
+        )
     await ctx.send(msg)
 
 
